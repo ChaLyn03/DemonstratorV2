@@ -65,53 +65,42 @@ import { progress } from './Worker.js';
  */
 Logging.log('[Pipe Shop] {Starting work pack data creation...|yellow}');
 
-/* ============================================================================
- * OPTIMISATION ROI NOTES
- * ============================================================================
- * These comments are intentionally separate from the documentation comments.
- * They describe the highest-return runtime improvements to implement later,
- * without changing current behaviour in this version.
- *
- * Highest ROI items in this file:
- *
- * 1. Replace repeated Array.find / Array.filter scans with prebuilt Maps.
- *    This file repeatedly scans large arrays by spoolID, activityID, workpackID,
- *    userCode, and DRL. That creates a large amount of avoidable O(n*m) work.
- *
- * 2. Replace duplicate detection arrays with Set-based membership checks.
- *    usedUids.includes(uid) is linear for every row. A Set would reduce that
- *    duplicate pass to near O(n).
- *
- * 3. Pre-group related datasets once, then reuse.
- *    Examples:
- *    - drawings by spoolID
- *    - activities by spoolID
- *    - pressure-testing rows by spoolID
- *    - DOSR rows by spoolID
- *    - Cognos DRLs by activityID
- *    - AVEVA rows by workpackID
- *    These are currently rebuilt through repeated filters during enrichment.
- *
- * 4. Convert existence checks into Set lookups.
- *    spoolDatabase.find(spool => spool.spoolID === x) is used many times only
- *    to answer "does this spool exist?". A Set of spoolIDs is the cheapest fix.
- *
- * 5. Reduce repeated date formatting work with a small helper.
- *    Not the biggest cost, but it removes duplicated logic and repeated checks.
- *
- * 6. Avoid repeated .at(-1) and repeated array indexing after filter passes.
- *    Store the selected object once where the same last or first item is reused.
- *
- * Order of implementation if runtime is the priority:
- *   a) spoolID Set + key Maps
- *   b) grouped lookups for enrichment
- *   c) Set-based duplicate handling
- *   d) grouped AVEVA/Cognos derivation
- *   e) minor cleanup helpers
- *
- * Most of the runtime cost in this worker is lookup strategy, not parsing.
- * ============================================================================
+/**
+ * Shared helpers
+ * --------------
+ * These helpers are intentionally small and local so the file remains diffable
+ * while removing repeated lookup / formatting work.
  */
+const formatDate = (value) => (value?.constructor === Date ? value.toISOString().split('T')[0] : '');
+
+const groupBy = (rows, keySelector) => {
+  const grouped = new Map();
+
+  rows.forEach((row) => {
+    const key = keySelector(row);
+    if (key === undefined || key === null || key === '') { return; }
+    if (!grouped.has(key)) {
+      grouped.set(key, []);
+    }
+    grouped.get(key).push(row);
+  });
+
+  return grouped;
+};
+
+const mapFirstBy = (rows, keySelector) => {
+  const mapped = new Map();
+
+  rows.forEach((row) => {
+    const key = keySelector(row);
+    if (key === undefined || key === null || key === '') { return; }
+    if (!mapped.has(key)) {
+      mapped.set(key, row);
+    }
+  });
+
+  return mapped;
+};
 
 /**
  * Static path configuration
@@ -438,23 +427,13 @@ let spoolPressureTesting = dataToSpreadsheet(workerData.data.fileData['windchill
  */
 progress(false, false, 27);
 
-/* OPTIMISATION ROI:
- * After all source reads complete, this is the best place to build shared
- * lookup structures once, before heavy filtering and enrichment begins.
- *
- * Highest-value candidates:
- * - const spoolIds = new Set(spoolDatabase.map(spool => spool.spoolID));
- * - const spoolById = new Map(spoolDatabase.map(spool => [spool.spoolID, spool]));
- * - const drawingsBySpoolId = Map<spoolID, drawing[]>
- * - const spoolBlocksBySpoolId = Map<spoolID, spoolBlock>
- * - const pressureTestingBySpoolId = Map<spoolID, pt[]>
- * - const dosrBySpoolId = Map<spoolID, dosr[]>
- * - const cognosByActivityId = Map<activityID, cognosActivity>
- * - const cognosDrlsByActivityId = Map<activityID, drl[]>
- * - const avevaRowsByWorkpackId = Map<workpackID, row[]>
- *
- * Building these once removes most repeated full-array scans below.
+/**
+ * Shared lookup structures
+ * ------------------------
+ * Built once before the heaviest filtering and enrichment passes.
  */
+let spoolById = mapFirstBy(spoolDatabase, spool => spool.spoolID);
+let spoolIds = new Set(spoolById.keys());
 
 /**
  * Stage 2A - Duplicate flagging in iBomRoutedSystems
@@ -470,41 +449,19 @@ progress(false, false, 27);
  * Why undefined first, instead of filter immediately:
  *   This preserves index-position mutation during the pass, then later filter
  *   stages remove undefined entries cleanly.
- *
- * Implementation note:
- *   usedUids is an array, so includes(uid) is linear-time lookup.
- *   That is fine here because the task requested comments only, not changes.
  */
-// OPTIMISATION NOTES (runtime, highest ROI)
-// - Highest ROI here: replace usedUids array + includes() with a Set.
-//   Current behaviour performs an O(n) lookup for every row, making the
-//   duplicate-detection pass trend toward O(n^2) as the dataset grows.
-// - Same output, much lower runtime: Set.has(uid) / Set.add(uid).
-// - This is one of the cheapest changes to implement and one of the biggest
-//   wins in the whole file because this pass touches the full routed-systems set.
 Logging.log(`[Pipe Shop] {Flagging duplicates in iBomRoutedSystems...|yellow} [length: ${iBomRoutedSystems.length}]`);
-let usedUids = [];
+const usedUids = new Set();
 iBomRoutedSystems.forEach((pipe, index) => {
-  let uid = `${pipe.spoolID}_${pipe.pipeID}_${pipe.userCode}`;
-  if (usedUids.includes(uid)) {
+  const uid = `${pipe.spoolID}_${pipe.pipeID}_${pipe.userCode}`;
+  if (usedUids.has(uid)) {
     iBomRoutedSystems[index] = undefined;
     return false;
   }
-  usedUids.push(uid);
+  usedUids.add(uid);
   return true;
 });
-Logging.warn(`[Pipe Shop] Finished flagging duplicates in iBomRoutedSystems, found ${usedUids.length} entires with 1 or more duplicates.`);
-
-/* OPTIMISATION ROI:
- * This is one of the clearest wins in the whole file.
- * Current complexity is effectively O(n^2) because includes() scans usedUids.
- * A Set-based seen-UID lookup preserves behaviour and drops this pass to O(n).
- *
- * Safe future shape:
- *   const usedUids = new Set();
- *   if (usedUids.has(uid)) ...
- *   usedUids.add(uid);
- */
+Logging.warn(`[Pipe Shop] Finished flagging duplicates in iBomRoutedSystems, found ${usedUids.size} entires with 1 or more duplicates.`);
 
 progress(false, false, 50);
 
@@ -546,27 +503,15 @@ progress(false, false, 51);
  *   tempEx contains missing extended records and is concatenated into the
  *   active pipeDatabase.
  */
-// OPTIMISATION NOTES (runtime, highest ROI)
-// - Highest ROI here: pre-build a Set of pipeDatabase userCode values before
-//   scanning extendedPipeDatabase.
-// - Current behaviour does a full pipeDatabase.find(...) for each extended row,
-//   which is another repeated O(n*m) pattern.
-// - A Set-backed membership check would reduce this stage to near-linear time
-//   while preserving the exact same matching rule (userCode).
-let tempEx = extendedPipeDatabase.filter(exPipe => !pipeDatabase.find(pipe => pipe.userCode === exPipe.userCode));
+const pipeUserCodes = new Set(pipeDatabase.map(pipe => pipe.userCode));
+let tempEx = extendedPipeDatabase.filter((exPipe) => {
+  if (pipeUserCodes.has(exPipe.userCode)) { return false; }
+  pipeUserCodes.add(exPipe.userCode);
+  return true;
+});
 pipeDatabase = pipeDatabase.concat(tempEx);
 Logging.warn(`[Pipe Shop] Adding missing pipe to pipeDatabase, added: ${tempEx.length}`);
 Logging.warn(`[Pipe Shop] Updated pipeDatabase... [length: ${pipeDatabase.length}]`);
-
-/* OPTIMISATION ROI:
- * This backfill currently does a full pipeDatabase scan for every extended pipe.
- * A Set of existing userCode values gives a major speedup on large pipe sets.
- *
- * Best later approach:
- * - build const pipeUserCodes = new Set(pipeDatabase.map(pipe => pipe.userCode))
- * - filter extendedPipeDatabase using pipeUserCodes.has(exPipe.userCode)
- * - if concatenating, update the Set as records are accepted
- */
 
 progress(false, false, 55);
 
@@ -587,24 +532,10 @@ progress(false, false, 55);
  */
 // Pipe Database
 Logging.log(`[Pipe Shop] {Filtering & Extending pipeDatabase...|yellow} [length: ${pipeDatabase.length}]`);
-// OPTIMISATION NOTES (runtime, highest ROI)
-// - Highest ROI here: build a spool lookup structure once, before the major
-//   filtering/enrichment stages:
-//     1) Set for existence checks by spoolID
-//     2) Map for direct spool retrieval by spoolID
-// - Current code repeatedly scans spoolDatabase with .find(...) inside many
-//   loops. That creates a large amount of avoidable repeated work.
-// - This single change would accelerate:
-//   * pipeDatabase validation
-//   * bendRatioDatabase validation
-//   * iBomRoutedSystems validation
-//   * AVEVA activity filtering
-//   * bend-ratio enrichment
-//   * any later spool-based lookups
 pipeDatabase = pipeDatabase.filter((pipe) => {
   if (!pipe.spoolID) { return false; }
   if (!pipe.pipeID) { return false; }
-  if (!spoolDatabase.find(spool => spool.spoolID === pipe.spoolID)) { return false; }
+  if (!spoolIds.has(pipe.spoolID)) { return false; }
 
   // Use the filter pass to extend pipe properties
   pipe.bendRatio = 0;
@@ -612,12 +543,6 @@ pipeDatabase = pipeDatabase.filter((pipe) => {
   return true;
 });
 Logging.warn(`[Pipe Shop] Filtered pipeDatabase: ${pipeDatabase.length}`);
-
-/* OPTIMISATION ROI:
- * Another very high-return fix.
- * The spool existence check currently scans spoolDatabase for every pipe row.
- * Replacing this with a prebuilt Set of spoolIDs removes a major repeated cost.
- */
 
 progress(false, false, 60);
 
@@ -633,23 +558,12 @@ progress(false, false, 60);
  */
 // Pipe Bend Data
 Logging.log(`[Pipe Shop] {Filtering bendRatioDatabase...|yellow} [length: ${bendRatioDatabase.length}]`);
-// OPTIMISATION NOTES (runtime, highest ROI)
-// - This stage would benefit directly from the same precomputed spoolID Set
-//   mentioned above.
-// - Without that, each retained bend-ratio row performs a linear scan across
-//   spoolDatabase just to answer an existence question.
 bendRatioDatabase = bendRatioDatabase.filter((pipe) => {
   if (!pipe.spoolID) { return false; }
-  if (!spoolDatabase.find(spool => spool.spoolID === pipe.spoolID)) { return false; }
+  if (!spoolIds.has(pipe.spoolID)) { return false; }
   return true;
 });
 Logging.warn(`[Pipe Shop] Filtered bendRatioDatabase: ${bendRatioDatabase.length}`);
-
-/* OPTIMISATION ROI:
- * Same issue as above. This should also use the same shared spoolID Set.
- * Reusing one lookup object across all spool existence checks is cheap and
- * removes repeated full scans in multiple stages.
- */
 
 progress(false, false, 65);
 
@@ -684,27 +598,15 @@ Logging.warn(`[Pipe Shop] Filtered drawings: ${drawings.length}`);
  */
 // iBom > Routed Systems (e.g. Pipes and Parts)
 Logging.log(`[Pipe Shop] {Filtering iBomRoutedSystems...|yellow} [length: ${iBomRoutedSystems.length}]`);
-// OPTIMISATION NOTES (runtime, highest ROI)
-// - Same issue again: repeated spoolDatabase.find(...) inside a full-dataset
-//   filter pass.
-// - Consolidating spool lookups behind a Set/Map would remove another major
-//   source of repeated linear scans.
-// - Because this file validates several large datasets against the same spool
-//   identity set, shared indexes have a compounding payoff.
 iBomRoutedSystems = iBomRoutedSystems.filter((pipe) => {
   if (!pipe) { return false; }
   if (!pipe.spoolID) { return false; }
   if (!pipe.pipeID) { return false; }
   if (pipe.pipeID.startsWith('PIPE')) { return false; }
-  if (!spoolDatabase.find(spool => spool.spoolID === pipe.spoolID)) { return false; }
+  if (!spoolIds.has(pipe.spoolID)) { return false; }
   return true;
 });
 Logging.warn(`[Pipe Shop] Filtered iBomRoutedSystems: ${iBomRoutedSystems.length}`);
-
-/* OPTIMISATION ROI:
- * This is the third separate pass using spoolDatabase.find for existence only.
- * A shared Set would remove all three repeated scans together.
- */
 
 progress(false, false, 70);
 
@@ -713,7 +615,17 @@ progress(false, false, 70);
 ////////////////////////////////
 
 /**
- * Stage 3A - Derive AVEVA activity records
+ * Stage 3A - Build shared AVEVA / Cognos lookups
+ * ----------------------------------------------
+ * These preserve first-match and original row-order behaviour while removing
+ * repeated full-array scans during derivation.
+ */
+const cognosActivityById = mapFirstBy(cognosActivityDetails, item => item.activityID);
+const cognosDrlsByActivityId = groupBy(cognosDrlDetails, entry => entry.activityID);
+const avevaRowsByWorkpackId = groupBy(avevaDataDump, row => row.workpackID);
+
+/**
+ * Stage 3B - Derive AVEVA activity records
  * ----------------------------------------
  * Goal:
  *   Build a clean activity list from AVEVA rows marked as activities and tied
@@ -741,39 +653,10 @@ progress(false, false, 70);
 
 // e.g. activity number and DRLs
 Logging.log('[Pipe Shop] {Process AVEVA activities...|yellow}');
-// OPTIMISATION NOTES (runtime, highest ROI)
-// - Highest ROI area in the AVEVA stage: pre-index dependent datasets before
-//   iterating the full avevaDataDump.
-// - Current per-row work repeatedly scans:
-//   * spoolDatabase            -> spool existence
-//   * cognosDrlDetails         -> activity-linked DRLs
-//   * avevaDataDump            -> parent job resolution
-//   * cognosActivityDetails    -> matching activity revision
-// - Best payoff:
-//   * Map<spoolID, spool>
-//   * Map<activityID, cognos activity>
-//   * Map<activityID, cognos DRL rows[]>
-//   * Map<workpackID, candidate parent-job rows[]>
-// - That would convert several nested scans into direct lookups and materially
-//   reduce runtime in the heaviest derived-data section of the file.
 const activities = [];
 avevaDataDump.forEach((row) => {
   if (row.isActivity && row.spoolID) {
-    if (spoolDatabase.find(spool => spool.spoolID === row.spoolID)) {
-
-      // Remove errors in requestedSpools
-      /* let uniqueRequestedSpools = [...new Set(row.requestedSpools)];
-      let index = uniqueRequestedSpools.indexOf(row.spoolID);
-      if (index >= 0) { uniqueRequestedSpools.splice(index, 1); }
-      row.requestedSpools = uniqueRequestedSpools;
-      if (row.requestedSpools.length === 0) { row.isActivity = true; } */
-
-      /**
-       * Base activity projection
-       * ------------------------
-       * Extracts only the fields required by downstream consumers and converts
-       * Date objects to YYYY-MM-DD strings where present.
-       */
+    if (spoolIds.has(row.spoolID)) {
       const activity = {
         row: row.rowIndex,
         spoolID: row.spoolID,
@@ -782,76 +665,36 @@ avevaDataDump.forEach((row) => {
         // drlParts: [],
         status: row.status || '',
         description: row.description,
-        plannedStart: row.plannedStart?.constructor === Date ? row.plannedStart.toISOString().split('T')[0] : '',
-        startDate: row.startDate?.constructor === Date ? row.startDate.toISOString().split('T')[0] : '',
-        finishDate: row.finishDate?.constructor === Date ? row.finishDate.toISOString().split('T')[0] : '',
+        plannedStart: formatDate(row.plannedStart),
+        startDate: formatDate(row.startDate),
+        finishDate: formatDate(row.finishDate),
         sequenceComments: row.sequenceComments,
         manufacture: row.manufacture,
-        manSetDate: row.manSetDate?.constructor === Date ? row.manSetDate.toISOString().split('T')[0] : '',
-        manIssueForecast: row.manIssueForecast?.constructor === Date ? row.manIssueForecast.toISOString().split('T')[0] : '',
+        manSetDate: formatDate(row.manSetDate),
+        manIssueForecast: formatDate(row.manIssueForecast),
         manComments: row.manComments,
         scopeComments: row.scopeComments,
-        releasedDate: row.releasedDate?.constructor === Date ? row.releasedDate.toISOString().split('T')[0] : '',
+        releasedDate: formatDate(row.releasedDate),
         nc: row.nc,
-        printIssueDate: row.printIssueDate?.constructor === Date ? row.printIssueDate.toISOString().split('T')[0] : '',
+        printIssueDate: formatDate(row.printIssueDate),
         prodJobPlanner: row.prodJobPlanner,
         releaseHoldUp: row.releaseHoldUp,
-        planningReadyDate: row.planningReadyDate?.constructor === Date ? row.planningReadyDate.toISOString().split('T')[0] : '',
+        planningReadyDate: formatDate(row.planningReadyDate),
         revisionReason: row.revisionReason,
         workDescription: row.workDescription
       };
 
-      /**
-       * Related DRL extraction
-       * ----------------------
-       * Pull all Cognos DRL rows for the current activity, then separate into:
-       * - drlParts: DRLs linked to non-pipe items
-       * - drlPipes: DRLs linked to pipe items
-       *
-       * Sets are used to enforce uniqueness.
-       */
-            // OPTIMISATION NOTES (runtime)
-      // - This filter runs for every qualifying AVEVA activity.
-      // - Pre-grouping Cognos DRLs by activityID once upfront would remove this
-      //   repeated full scan and turn it into a direct lookup.
-      let relatedDrls = cognosDrlDetails.filter(entry => entry.activityID === row.activityID);
+      let relatedDrls = cognosDrlsByActivityId.get(row.activityID) || [];
 
       let drlParts = [...new Set(relatedDrls.filter(entry => !entry.pipeID.startsWith('PIPE')).map(entry => entry.drl))];
       let drlPipes = [...new Set(relatedDrls.filter(entry => entry.pipeID.startsWith('PIPE')).map(entry => entry.drl))];
 
       activity.drlParts = drlParts;
 
-      /**
-       * Parent job resolution
-       * ---------------------
-       * To determine the job that owns the current spool activity:
-       * 1. Temporarily clear row.requestedSpools
-       * 2. Search AVEVA for another item in same workpack whose requestedSpools
-       *    includes this activity's spoolID
-       *
-       * If found:
-       *   - that item's activityID becomes activity.jobID
-       *   - job DRL plus pipe DRLs are combined
-       *
-       * If not found:
-       *   - this activity is promoted to job status
-       *   - row.isJob is set true
-       *   - requestedSpools restored to the current spool
-       *   - activity links to itself as jobID
-       *
-       * This fallback preserves downstream integrity when parent job structure is
-       * absent or inconsistent in AVEVA source data.
-       */
-
       // Clear the spools so that this activity is detected as a job
       row.requestedSpools = [];
-            // OPTIMISATION NOTES (runtime)
-      // - Parent-job resolution is currently a scan across the whole AVEVA dump
-      //   for every activity.
-      // - A prebuilt index keyed by workpackID, and ideally also by requested
-      //   spool membership, would remove one of the most expensive repeated
-      //   searches in the file.
-      let job = avevaDataDump.find(item => (item.workpackID === row.workpackID) && item.requestedSpools.includes(row.spoolID));
+      const workpackRows = avevaRowsByWorkpackId.get(row.workpackID) || [];
+      let job = workpackRows.find(item => item.requestedSpools.includes(row.spoolID));
       if (job) {
         activity.jobID = job.activityID;
         activity.drlPipe = [...new Set([job.drl, ...drlPipes])];
@@ -863,52 +706,17 @@ avevaDataDump.forEach((row) => {
         activity.drlPipe = drlPipes;
       }
 
-      /**
-       * Cognos activity augmentation
-       * ----------------------------
-       * Adds revision metadata when a matching Cognos activity record exists.
-       *
-       * Derived flags:
-       * - redLine: revision contains 'RL'
-       * - blueLine: revision contains 'BL'
-       */
-            // OPTIMISATION NOTES (runtime)
-      // - A Map keyed by activityID would be the highest-ROI replacement for
-      //   this repeated find().
-      let cognos = cognosActivityDetails.find(item => item.activityID === row.activityID);
+      let cognos = cognosActivityById.get(row.activityID);
       if (cognos) {
         activity.revision = cognos.revision;
         activity.redLine = typeof cognos.revision === 'string' ? cognos.revision.includes('RL') : false;
         activity.blueLine = typeof cognos.revision === 'string' ? cognos.revision.includes('BL') : false;
       }
 
-      /**
-       * Commit the fully derived activity record.
-       */
       activities.push(activity);
     }
   }
 });
-
-/* OPTIMISATION ROI:
- * This activity derivation block is one of the biggest runtime hotspots.
- *
- * Current repeated costs inside the loop:
- * - spoolDatabase.find(...)                     -> spool existence scan
- * - cognosDrlDetails.filter(...)               -> full DRL scan per activity
- * - avevaDataDump.find(...)                    -> full AVEVA scan per activity
- * - cognosActivityDetails.find(...)            -> full Cognos scan per activity
- *
- * Best future optimisation strategy:
- * 1. Use spoolID Set for existence checks.
- * 2. Pre-group cognosDrlDetails by activityID.
- * 3. Pre-map cognosActivityDetails by activityID.
- * 4. Pre-group avevaDataDump by workpackID so the parent-job search is local
- *    to the workpack instead of scanning the entire AVEVA dataset each time.
- *
- * This single section likely offers the largest overall speedup after the
- * shared lookup structures are introduced.
- */
 
 /**
  * validWorkpacks
@@ -917,13 +725,14 @@ avevaDataDump.forEach((row) => {
  * included in the exported workpack list.
  */
 let validWorkpacks = new Set(activities.map(activity => activity.workpackID));
+const activitiesBySpoolId = groupBy(activities, activity => activity.spoolID);
 
 Logging.warn(`[Pipe Shop] AVEVA activities: ${activities.length}`);
 
 progress(false, false, 85);
 
 /**
- * Stage 3B - Derive DRL aggregates
+ * Stage 3C - Derive DRL aggregates
  * --------------------------------
  * Goal:
  *   Collapse raw Cognos DRL rows into a grouped DRL structure:
@@ -951,18 +760,12 @@ progress(false, false, 85);
  */
 Logging.log('[Pipe Shop] {Process AVEVA DRLs...|yellow}');
 const drls = [];
-// OPTIMISATION NOTES (runtime, medium-high ROI)
-// - DRL aggregation currently searches drls with .find(...) on every Cognos
-//   entry, so lookup cost grows as drls grows.
-// - A Map keyed by drl id would keep grouping behaviour identical while making
-//   insertion/lookup effectively constant time.
-// - Lower ROI than the shared spool indexes and AVEVA indexes, but still a
-//   worthwhile optimisation because this loop can be large.
+const drlById = new Map();
 cognosDrlDetails.forEach(entry => {
   // If no pipe length or part items were picked, skip this entry
   if (entry.pickQty === 0) { return false; }
 
-  let drl = drls.find(drlRow => drlRow.id === entry.drl);
+  let drl = drlById.get(entry.drl);
 
   // If DRL entry is missing, add to array and set drl to the new Obj
   if (!drl) {
@@ -978,6 +781,7 @@ cognosDrlDetails.forEach(entry => {
       }
     };
     drls.push(drl);
+    drlById.set(entry.drl, drl);
   }
 
   /**
@@ -1038,21 +842,10 @@ cognosDrlDetails.forEach(entry => {
 
 Logging.warn(`[Pipe Shop] AVEVA DRLs: ${drls.length}`);
 
-/* OPTIMISATION ROI:
- * drls.find(drlRow => drlRow.id === entry.drl) scans the current DRL output
- * array for every Cognos DRL row. As DRL count grows, this becomes expensive.
- *
- * High-return future fix:
- * - maintain a Map keyed by DRL id during construction
- * - keep the output array for ordering/serialisation if needed
- *
- * That preserves external structure while removing repeated group lookup scans.
- */
-
 progress(false, false, 88);
 
 /**
- * Stage 3C - Derive job records
+ * Stage 3D - Derive job records
  * -----------------------------
  * Goal:
  *   Export AVEVA rows currently marked as jobs into a simplified job structure.
@@ -1062,13 +855,8 @@ progress(false, false, 88);
  *   field, then uniqued.
  */
 Logging.log('[Pipe Shop] {Process AVEVA jobs...|yellow}');
-// OPTIMISATION NOTES (runtime, medium-high ROI)
-// - Job derivation repeats the same Cognos DRL filtering pattern already used
-//   in activities.
-// - Reusing a pre-grouped Map<activityID, drl rows[]> would optimise both
-//   stages at once and avoid duplicated full scans of cognosDrlDetails.
 const jobs = avevaDataDump.filter(activity => activity.isJob).map((job) => {
-  let relatedDrls = cognosDrlDetails.filter(entry => entry.activityID === job.activityID);
+  let relatedDrls = cognosDrlsByActivityId.get(job.activityID) || [];
   let drlPipes = [...new Set(relatedDrls.filter(entry => entry.pipeID.startsWith('PIPE')).map(entry => entry.drl))];
 
   return {
@@ -1086,16 +874,10 @@ const jobs = avevaDataDump.filter(activity => activity.isJob).map((job) => {
 });
 Logging.warn(`[Pipe Shop] AVEVA jobs: ${jobs.length}`);
 
-/* OPTIMISATION ROI:
- * The repeated cognosDrlDetails.filter(entry => entry.activityID === job.activityID)
- * should reuse the same activityID-grouped DRL lookup suggested for activities.
- * That gives a shared optimisation across both Stage 3A and 3C.
- */
-
 progress(false, false, 90);
 
 /**
- * Stage 3D - Derive workpack records
+ * Stage 3E - Derive workpack records
  * ----------------------------------
  * Inclusion rule:
  *   Export only AVEVA rows marked isWorkpack where the workpackID exists in
@@ -1111,14 +893,9 @@ progress(false, false, 90);
  * - selected hours breakdown
  */
 Logging.log('[Pipe Shop] {Process AVEVA workpacks...|yellow}');
-// OPTIMISATION NOTES (runtime, medium-high ROI)
-// - Workpack derivation repeatedly rescans avevaDataDump for:
-//   * hours rows per workpack
-//   * job rows per workpack
-// - Pre-grouping rows by workpackID once would let this stage reuse those
-//   arrays directly instead of paying for repeated full-dataset filters.
 const workpacks = avevaDataDump.filter(activity => activity.isWorkpack && validWorkpacks.has(activity.workpackID)).map((workpack) => {
-  let selectedHours = avevaDataDump.filter(activity => activity.isHours && (workpack.workpackID === activity.workpackID)).map((activity) => {
+  const workpackRows = avevaRowsByWorkpackId.get(workpack.workpackID) || [];
+  let selectedHours = workpackRows.filter(activity => activity.isHours).map((activity) => {
     return {
       activityID: activity.activityID,
       status: activity.status,
@@ -1149,22 +926,11 @@ const workpacks = avevaDataDump.filter(activity => activity.isWorkpack && validW
     workpackID: workpack.workpackID,
     description: workpack.description,
     status: workpack.status,
-    jobs: avevaDataDump.filter(activity => activity.isJob && (workpack.workpackID === activity.workpackID)).map(activity => activity.activityID),
+    jobs: workpackRows.filter(activity => activity.isJob).map(activity => activity.activityID),
     hours: selectedHours
   };
 });
 Logging.warn(`[Pipe Shop] AVEVA workpacks: ${workpacks.length}`);
-
-/* OPTIMISATION ROI:
- * Workpack derivation currently re-scans avevaDataDump multiple times per
- * workpack:
- * - once for hours rows
- * - once for job rows
- *
- * Best future fix:
- * pre-group AVEVA rows by workpackID once, then derive hours/jobs from the
- * small local group instead of scanning the full dataset for every workpack.
- */
 
 // Check for orphan activities
 /* activities.filter((activity) => {
@@ -1185,7 +951,18 @@ Logging.warn(`[Pipe Shop] AVEVA workpacks: ${workpacks.length}`);
 progress(false, false, 93);
 
 /**
- * Stage 4A - Apply bend-ratio values to pipeDatabase
+ * Stage 4A - Build shared enrichment lookups
+ * ------------------------------------------
+ * Built after activities exist so spool enrichment can use constant-time access.
+ */
+const pipeByUserCodeSpoolId = mapFirstBy(pipeDatabase, pipe => `${pipe.userCode}__${pipe.spoolID}`);
+const spoolBlockBySpoolId = mapFirstBy(spoolBlocks, spoolBlock => spoolBlock.spoolID);
+const drawingsBySpoolId = groupBy(drawings, drawing => drawing.spoolID);
+const pressureTestingBySpoolId = groupBy(spoolPressureTesting, ptSpool => ptSpool.spoolID);
+const dosrBySpoolId = groupBy(dosr, dosrSpool => dosrSpool.spoolID);
+
+/**
+ * Stage 4B - Apply bend-ratio values to pipeDatabase
  * --------------------------------------------------
  * Goal:
  *   Find the matching pipe by (userCode + spoolID) and assign bendRatio.
@@ -1204,21 +981,14 @@ progress(false, false, 93);
 Logging.log('[Pipe Shop] {Extending pipeDatabase...|yellow} [adding bend information]');
 const validBendRatios = [2, 3, 11.8, 14.9];
 const invalidHeijunka = ['MAS', 'N/A', 'CHOOSE THE APPLICABLE CODE'];
-// OPTIMISATION NOTES (runtime, highest ROI)
-// - Highest ROI here: build a composite-key Map for pipes, e.g.
-//   `${userCode}__${spoolID}` -> pipe row.
-// - Current behaviour scans pipeDatabase for every bend item, which becomes
-//   expensive at scale.
-// - This same pipe index could also support other future pipe-level enrichments
-//   without additional search cost.
 bendRatioDatabase.forEach((bendItem) => {
-  let pipe = pipeDatabase.find(pipe => (pipe.userCode === bendItem.userCode) && (pipe.spoolID === bendItem.spoolID));
+  let pipe = pipeByUserCodeSpoolId.get(`${bendItem.userCode}__${bendItem.spoolID}`);
   if (pipe) {
-    pipe.bendRatio = bendItem.bendRatio; 
+    pipe.bendRatio = bendItem.bendRatio;
     let value = parseFloat(bendItem.bendRatio);
     let baseValue = Math.floor(value);
     if (baseValue !== 2 && baseValue !== 3) {
-      let spool = spoolDatabase.find(spool => spool.spoolID === pipe.spoolID);
+      let spool = spoolById.get(pipe.spoolID);
       if (spool && !validBendRatios.includes(value) && !invalidHeijunka.includes(spool.heijunka)) {
         Logging.error(`[Pipe Shop] [${pipe.spoolID}] Invalid Bend Ratio: ${value} [${spool.heijunka}]`);
       }
@@ -1226,19 +996,10 @@ bendRatioDatabase.forEach((bendItem) => {
   }
 });
 
-/* OPTIMISATION ROI:
- * This loop should eventually use:
- * - a pipe lookup keyed by `${userCode}__${spoolID}`
- * - a spool lookup keyed by spoolID
- *
- * Right now every bend item may scan both pipeDatabase and spoolDatabase.
- * That makes this enrichment much more expensive than necessary.
- */
-
 progress(false, false, 95);
 
 /**
- * Stage 4B - Enrich spoolDatabase
+ * Stage 4C - Enrich spoolDatabase
  * -------------------------------
  * For each spool:
  * 1. Find matching spool block record
@@ -1254,24 +1015,11 @@ progress(false, false, 95);
  *   that spool.
  */
 Logging.log('[Pipe Shop] {Extending spoolDatabase...|yellow}');
-// OPTIMISATION NOTES (runtime, highest ROI)
-// - This is the other major hotspot.
-// - For each spool, the current code performs repeated .find() / .filter()
-//   scans across multiple full datasets:
-//   * spoolBlocks
-//   * drawings
-//   * activities
-//   * spoolPressureTesting
-//   * dosr
-// - Highest ROI improvement: pre-group each of those datasets by spoolID once,
-//   then enrich each spool via direct lookup.
-// - This would drastically reduce total runtime because spool enrichment is
-//   currently a nested-scan fan-out stage over several collections.
 spoolDatabase.forEach((spool) => {
-  let spoolBlock = spoolBlocks.find(spoolBlock => spoolBlock.spoolID === spool.spoolID);
+  let spoolBlock = spoolBlockBySpoolId.get(spool.spoolID);
   if (spoolBlock) {
     /**
-     * 4B.1 - Block / physical location / planning metadata
+     * 4C.1 - Block / physical location / planning metadata
      * ----------------------------------------------------
      * compartment is normalised to number where possible.
      */
@@ -1288,12 +1036,13 @@ spoolDatabase.forEach((spool) => {
     spool.childObsolete = spoolBlock.childObsolete;
 
     /**
-     * 4B.2 - Drawing attachment
+     * 4C.2 - Drawing attachment
      * -------------------------
      * Adds all drawings matching the spool, with a derived pmf boolean flag.
      */
     // Append drawing information, as it came from Foran
-    spool.drawings = drawings.filter(drawing => drawing.spoolID === spool.spoolID).map((drawing) => {
+    const spoolDrawings = drawingsBySpoolId.get(spool.spoolID) || [];
+    spool.drawings = spoolDrawings.map((drawing) => {
       return {
         pmf: drawing.drawingNum.startsWith('HCF-PMF'),
         number: drawing.drawingNum,
@@ -1302,15 +1051,15 @@ spoolDatabase.forEach((spool) => {
     });
 
     /**
-     * 4B.3 - Activity attachment
+     * 4C.3 - Activity attachment
      * --------------------------
      * Appends all derived AVEVA activities linked to this spool.
      */
     // Append the activity details from AVEVA
-    spool.activities = activities.filter(activity => activity.spoolID === spool.spoolID);
+    spool.activities = activitiesBySpoolId.get(spool.spoolID) || [];
 
     /**
-     * 4B.4 - Pressure-testing enrichment
+     * 4C.4 - Pressure-testing enrichment
      * ----------------------------------
      * Rules:
      * - If multiple pressure-testing records exist, warn and use the first
@@ -1319,10 +1068,7 @@ spoolDatabase.forEach((spool) => {
      * - pressureSection is a formatted string derived from subsystem + lrClass
      */
     // Append the pressure testing information
-    // OPTIMISATION NOTES (runtime)
-    // - Pre-group pressure-testing rows by spoolID to avoid filtering the full
-    //   pressure-testing dataset for every spool.
-    let ptSpoolList = spoolPressureTesting.filter(ptSpool => ptSpool.spoolID === spool.spoolID);
+    let ptSpoolList = pressureTestingBySpoolId.get(spool.spoolID) || [];
     if (ptSpoolList.length > 1) {
       Logging.warn(`[Pipe Shop] Multiple pressure testing data entries found for spool {${spool.spoolID}|cyan}. The first entry will be used.`);
     }
@@ -1341,7 +1087,7 @@ spoolDatabase.forEach((spool) => {
     }
 
     /**
-     * 4B.5 - DOSR enrichment
+     * 4C.5 - DOSR enrichment
      * ----------------------
      * Uses all DOSR records matching the spoolID.
      *
@@ -1353,9 +1099,7 @@ spoolDatabase.forEach((spool) => {
      *   The duplicate-warning block is intentionally commented out in the
      *   original source and remains unchanged.
      */
-    // OPTIMISATION NOTES (runtime)
-    // - Same pattern as pressure testing: pre-group DOSR rows by spoolID once.
-    let dosrSpoolList = dosr.filter(dosrSpool => dosrSpool.spoolID === spool.spoolID);
+    let dosrSpoolList = dosrBySpoolId.get(spool.spoolID) || [];
 
     // if (dosrSpoolList.length > 1) {
     //   Logging.warn(`[Pipe Shop] Multiple DOSR entries found for spool {${spool.spoolID}|cyan}. The last entry will be used.`);
@@ -1367,10 +1111,11 @@ spoolDatabase.forEach((spool) => {
       spool.installStart = '';
       spool.makeOrBuy = '';
     } else {
-      spool.installID = dosrSpoolList.at(-1).installID;
-      spool.installDescription = dosrSpoolList.at(-1).installDescription;
-      spool.installStart = dosrSpoolList.at(-1)?.installStart.toISOString().split('T')[0] || '';
-      spool.makeOrBuy = dosrSpoolList.at(-1).makeOrBuy;
+      const lastDosr = dosrSpoolList.at(-1);
+      spool.installID = lastDosr.installID;
+      spool.installDescription = lastDosr.installDescription;
+      spool.installStart = formatDate(lastDosr?.installStart) || '';
+      spool.makeOrBuy = lastDosr.makeOrBuy;
     }
 
     // if (spool.activities.length) { console.log(spool) }
@@ -1387,32 +1132,6 @@ spoolDatabase.forEach((spool) => {
     }  */   
   }
 });
-
-/* OPTIMISATION ROI:
- * This spool enrichment loop is probably the single worst repeated-scan section
- * in the file after AVEVA activity derivation.
- *
- * For every spool it currently does:
- * - spoolBlocks.find(...)
- * - drawings.filter(...)
- * - activities.filter(...)
- * - spoolPressureTesting.filter(...)
- * - dosr.filter(...)
- *
- * That means multiple full-array scans per spool.
- *
- * Best future fix:
- * pre-group each related dataset by spoolID once:
- * - spoolBlockBySpoolId        -> Map<spoolID, spoolBlock>
- * - drawingsBySpoolId          -> Map<spoolID, drawing[]>
- * - activitiesBySpoolId        -> Map<spoolID, activity[]>
- * - pressureTestingBySpoolId   -> Map<spoolID, pt[]>
- * - dosrBySpoolId              -> Map<spoolID, dosr[]>
- *
- * Then this loop becomes almost entirely constant-time lookup work.
- *
- * That change is high ROI and low semantic risk if implemented carefully.
- */
 
 
 /////////////////////////////////////////////////////////////
