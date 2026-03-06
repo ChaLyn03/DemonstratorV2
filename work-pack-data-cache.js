@@ -1184,6 +1184,10 @@ Object.keys(files).forEach((key) => {
  * The pretty-printed alternative remains commented out for optional debugging.
  */
 // if (!fs.existsSync(outputFolder)) { fs.mkdirSync(outputFolder, {recursive: true}); }
+if (!fs.existsSync(outputFolder)) {
+  fs.mkdirSync(outputFolder, { recursive: true });
+}
+
 fs.writeFileSync(output, JSON.stringify(cacheData));
 // fs.writeFileSync(output, JSON.stringify(cacheData, null, '  '));
 
