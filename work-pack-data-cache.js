@@ -65,6 +65,54 @@ import { progress } from './Worker.js';
  */
 Logging.log('[Pipe Shop] {Starting work pack data creation...|yellow}');
 
+/* ============================================================================
+ * OPTIMISATION ROI NOTES
+ * ============================================================================
+ * These comments are intentionally separate from the documentation comments.
+ * They describe the highest-return runtime improvements to implement later,
+ * without changing current behaviour in this version.
+ *
+ * Highest ROI items in this file:
+ *
+ * 1. Replace repeated Array.find / Array.filter scans with prebuilt Maps.
+ *    This file repeatedly scans large arrays by spoolID, activityID, workpackID,
+ *    userCode, and DRL. That creates a large amount of avoidable O(n*m) work.
+ *
+ * 2. Replace duplicate detection arrays with Set-based membership checks.
+ *    usedUids.includes(uid) is linear for every row. A Set would reduce that
+ *    duplicate pass to near O(n).
+ *
+ * 3. Pre-group related datasets once, then reuse.
+ *    Examples:
+ *    - drawings by spoolID
+ *    - activities by spoolID
+ *    - pressure-testing rows by spoolID
+ *    - DOSR rows by spoolID
+ *    - Cognos DRLs by activityID
+ *    - AVEVA rows by workpackID
+ *    These are currently rebuilt through repeated filters during enrichment.
+ *
+ * 4. Convert existence checks into Set lookups.
+ *    spoolDatabase.find(spool => spool.spoolID === x) is used many times only
+ *    to answer "does this spool exist?". A Set of spoolIDs is the cheapest fix.
+ *
+ * 5. Reduce repeated date formatting work with a small helper.
+ *    Not the biggest cost, but it removes duplicated logic and repeated checks.
+ *
+ * 6. Avoid repeated .at(-1) and repeated array indexing after filter passes.
+ *    Store the selected object once where the same last or first item is reused.
+ *
+ * Order of implementation if runtime is the priority:
+ *   a) spoolID Set + key Maps
+ *   b) grouped lookups for enrichment
+ *   c) Set-based duplicate handling
+ *   d) grouped AVEVA/Cognos derivation
+ *   e) minor cleanup helpers
+ *
+ * Most of the runtime cost in this worker is lookup strategy, not parsing.
+ * ============================================================================
+ */
+
 /**
  * Static path configuration
  * -------------------------
@@ -390,6 +438,24 @@ let spoolPressureTesting = dataToSpreadsheet(workerData.data.fileData['windchill
  */
 progress(false, false, 27);
 
+/* OPTIMISATION ROI:
+ * After all source reads complete, this is the best place to build shared
+ * lookup structures once, before heavy filtering and enrichment begins.
+ *
+ * Highest-value candidates:
+ * - const spoolIds = new Set(spoolDatabase.map(spool => spool.spoolID));
+ * - const spoolById = new Map(spoolDatabase.map(spool => [spool.spoolID, spool]));
+ * - const drawingsBySpoolId = Map<spoolID, drawing[]>
+ * - const spoolBlocksBySpoolId = Map<spoolID, spoolBlock>
+ * - const pressureTestingBySpoolId = Map<spoolID, pt[]>
+ * - const dosrBySpoolId = Map<spoolID, dosr[]>
+ * - const cognosByActivityId = Map<activityID, cognosActivity>
+ * - const cognosDrlsByActivityId = Map<activityID, drl[]>
+ * - const avevaRowsByWorkpackId = Map<workpackID, row[]>
+ *
+ * Building these once removes most repeated full-array scans below.
+ */
+
 /**
  * Stage 2A - Duplicate flagging in iBomRoutedSystems
  * --------------------------------------------------
@@ -428,6 +494,17 @@ iBomRoutedSystems.forEach((pipe, index) => {
   return true;
 });
 Logging.warn(`[Pipe Shop] Finished flagging duplicates in iBomRoutedSystems, found ${usedUids.length} entires with 1 or more duplicates.`);
+
+/* OPTIMISATION ROI:
+ * This is one of the clearest wins in the whole file.
+ * Current complexity is effectively O(n^2) because includes() scans usedUids.
+ * A Set-based seen-UID lookup preserves behaviour and drops this pass to O(n).
+ *
+ * Safe future shape:
+ *   const usedUids = new Set();
+ *   if (usedUids.has(uid)) ...
+ *   usedUids.add(uid);
+ */
 
 progress(false, false, 50);
 
@@ -481,6 +558,16 @@ pipeDatabase = pipeDatabase.concat(tempEx);
 Logging.warn(`[Pipe Shop] Adding missing pipe to pipeDatabase, added: ${tempEx.length}`);
 Logging.warn(`[Pipe Shop] Updated pipeDatabase... [length: ${pipeDatabase.length}]`);
 
+/* OPTIMISATION ROI:
+ * This backfill currently does a full pipeDatabase scan for every extended pipe.
+ * A Set of existing userCode values gives a major speedup on large pipe sets.
+ *
+ * Best later approach:
+ * - build const pipeUserCodes = new Set(pipeDatabase.map(pipe => pipe.userCode))
+ * - filter extendedPipeDatabase using pipeUserCodes.has(exPipe.userCode)
+ * - if concatenating, update the Set as records are accepted
+ */
+
 progress(false, false, 55);
 
 /**
@@ -526,6 +613,12 @@ pipeDatabase = pipeDatabase.filter((pipe) => {
 });
 Logging.warn(`[Pipe Shop] Filtered pipeDatabase: ${pipeDatabase.length}`);
 
+/* OPTIMISATION ROI:
+ * Another very high-return fix.
+ * The spool existence check currently scans spoolDatabase for every pipe row.
+ * Replacing this with a prebuilt Set of spoolIDs removes a major repeated cost.
+ */
+
 progress(false, false, 60);
 
 /**
@@ -551,6 +644,12 @@ bendRatioDatabase = bendRatioDatabase.filter((pipe) => {
   return true;
 });
 Logging.warn(`[Pipe Shop] Filtered bendRatioDatabase: ${bendRatioDatabase.length}`);
+
+/* OPTIMISATION ROI:
+ * Same issue as above. This should also use the same shared spoolID Set.
+ * Reusing one lookup object across all spool existence checks is cheap and
+ * removes repeated full scans in multiple stages.
+ */
 
 progress(false, false, 65);
 
@@ -601,6 +700,11 @@ iBomRoutedSystems = iBomRoutedSystems.filter((pipe) => {
   return true;
 });
 Logging.warn(`[Pipe Shop] Filtered iBomRoutedSystems: ${iBomRoutedSystems.length}`);
+
+/* OPTIMISATION ROI:
+ * This is the third separate pass using spoolDatabase.find for existence only.
+ * A shared Set would remove all three repeated scans together.
+ */
 
 progress(false, false, 70);
 
@@ -786,6 +890,26 @@ avevaDataDump.forEach((row) => {
   }
 });
 
+/* OPTIMISATION ROI:
+ * This activity derivation block is one of the biggest runtime hotspots.
+ *
+ * Current repeated costs inside the loop:
+ * - spoolDatabase.find(...)                     -> spool existence scan
+ * - cognosDrlDetails.filter(...)               -> full DRL scan per activity
+ * - avevaDataDump.find(...)                    -> full AVEVA scan per activity
+ * - cognosActivityDetails.find(...)            -> full Cognos scan per activity
+ *
+ * Best future optimisation strategy:
+ * 1. Use spoolID Set for existence checks.
+ * 2. Pre-group cognosDrlDetails by activityID.
+ * 3. Pre-map cognosActivityDetails by activityID.
+ * 4. Pre-group avevaDataDump by workpackID so the parent-job search is local
+ *    to the workpack instead of scanning the entire AVEVA dataset each time.
+ *
+ * This single section likely offers the largest overall speedup after the
+ * shared lookup structures are introduced.
+ */
+
 /**
  * validWorkpacks
  * --------------
@@ -914,6 +1038,17 @@ cognosDrlDetails.forEach(entry => {
 
 Logging.warn(`[Pipe Shop] AVEVA DRLs: ${drls.length}`);
 
+/* OPTIMISATION ROI:
+ * drls.find(drlRow => drlRow.id === entry.drl) scans the current DRL output
+ * array for every Cognos DRL row. As DRL count grows, this becomes expensive.
+ *
+ * High-return future fix:
+ * - maintain a Map keyed by DRL id during construction
+ * - keep the output array for ordering/serialisation if needed
+ *
+ * That preserves external structure while removing repeated group lookup scans.
+ */
+
 progress(false, false, 88);
 
 /**
@@ -950,6 +1085,12 @@ const jobs = avevaDataDump.filter(activity => activity.isJob).map((job) => {
   };
 });
 Logging.warn(`[Pipe Shop] AVEVA jobs: ${jobs.length}`);
+
+/* OPTIMISATION ROI:
+ * The repeated cognosDrlDetails.filter(entry => entry.activityID === job.activityID)
+ * should reuse the same activityID-grouped DRL lookup suggested for activities.
+ * That gives a shared optimisation across both Stage 3A and 3C.
+ */
 
 progress(false, false, 90);
 
@@ -1014,6 +1155,17 @@ const workpacks = avevaDataDump.filter(activity => activity.isWorkpack && validW
 });
 Logging.warn(`[Pipe Shop] AVEVA workpacks: ${workpacks.length}`);
 
+/* OPTIMISATION ROI:
+ * Workpack derivation currently re-scans avevaDataDump multiple times per
+ * workpack:
+ * - once for hours rows
+ * - once for job rows
+ *
+ * Best future fix:
+ * pre-group AVEVA rows by workpackID once, then derive hours/jobs from the
+ * small local group instead of scanning the full dataset for every workpack.
+ */
+
 // Check for orphan activities
 /* activities.filter((activity) => {
   let parentJobs = jobs.filter((job) => {
@@ -1073,6 +1225,15 @@ bendRatioDatabase.forEach((bendItem) => {
     }
   }
 });
+
+/* OPTIMISATION ROI:
+ * This loop should eventually use:
+ * - a pipe lookup keyed by `${userCode}__${spoolID}`
+ * - a spool lookup keyed by spoolID
+ *
+ * Right now every bend item may scan both pipeDatabase and spoolDatabase.
+ * That makes this enrichment much more expensive than necessary.
+ */
 
 progress(false, false, 95);
 
@@ -1226,6 +1387,32 @@ spoolDatabase.forEach((spool) => {
     }  */   
   }
 });
+
+/* OPTIMISATION ROI:
+ * This spool enrichment loop is probably the single worst repeated-scan section
+ * in the file after AVEVA activity derivation.
+ *
+ * For every spool it currently does:
+ * - spoolBlocks.find(...)
+ * - drawings.filter(...)
+ * - activities.filter(...)
+ * - spoolPressureTesting.filter(...)
+ * - dosr.filter(...)
+ *
+ * That means multiple full-array scans per spool.
+ *
+ * Best future fix:
+ * pre-group each related dataset by spoolID once:
+ * - spoolBlockBySpoolId        -> Map<spoolID, spoolBlock>
+ * - drawingsBySpoolId          -> Map<spoolID, drawing[]>
+ * - activitiesBySpoolId        -> Map<spoolID, activity[]>
+ * - pressureTestingBySpoolId   -> Map<spoolID, pt[]>
+ * - dosrBySpoolId              -> Map<spoolID, dosr[]>
+ *
+ * Then this loop becomes almost entirely constant-time lookup work.
+ *
+ * That change is high ROI and low semantic risk if implemented carefully.
+ */
 
 
 /////////////////////////////////////////////////////////////
