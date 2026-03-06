@@ -78,7 +78,6 @@ const groupBy = (rows, keySelector) => {
 
   rows.forEach((row) => {
     const key = keySelector(row);
-    if (key === undefined || key === null || key === '') { return; }
     if (!grouped.has(key)) {
       grouped.set(key, []);
     }
@@ -93,7 +92,6 @@ const mapFirstBy = (rows, keySelector) => {
 
   rows.forEach((row) => {
     const key = keySelector(row);
-    if (key === undefined || key === null || key === '') { return; }
     if (!mapped.has(key)) {
       mapped.set(key, row);
     }
@@ -506,7 +504,6 @@ progress(false, false, 51);
 const pipeUserCodes = new Set(pipeDatabase.map(pipe => pipe.userCode));
 let tempEx = extendedPipeDatabase.filter((exPipe) => {
   if (pipeUserCodes.has(exPipe.userCode)) { return false; }
-  pipeUserCodes.add(exPipe.userCode);
   return true;
 });
 pipeDatabase = pipeDatabase.concat(tempEx);
